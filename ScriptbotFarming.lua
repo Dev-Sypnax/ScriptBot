@@ -1,22 +1,18 @@
 --[[
     ============================================================
-      FPS BOOSTER v26.2 - Fullscreen Status Edition
-      - FULLSCREEN PURE-BLACK STATUS UI (no window, no buttons)
-      - No minimize / close / drag controls
-      - Live status readout only + notification log
+      FPS BOOSTER v26.1 - Premium Edition (FULLSCREEN BLACK)
+      - Full-screen black UI that covers everything
+      - No minimize buttons, no floating toggle
+      - Premium tabbed UI (Dashboard / Settings / Diagnostics)
       - Per-game blacklist (auto-learned)
       - Distance-based part culling
       - Selective reapply (dirty-count aware)
+      - FPS / RAM / Ping sparklines
       - Instance counter
       - Benchmark (on vs off delta)
       - Presets: MaxFPS / Balanced / Visual
-      - Auto-reconnect / auto-join / player tracker
+      - Toast notifications
     ============================================================
-
-    To hide/show the overlay from your executor console:
-        getgenv().__FPS_BOOSTER_V26.setOverlay(false)   -- hide
-        getgenv().__FPS_BOOSTER_V26.setOverlay(true)    -- show
-        getgenv().__FPS_BOOSTER_V26.destroy()           -- unload
 ]]
 
 -- ============================================================
@@ -43,7 +39,7 @@ local CFG = {
     KILL_HUMANOID       = true,
     MUTE_ALL_SOUNDS     = true,
     REAPPLY_ON_SPAWN    = true,
-    BLACK_SCREEN        = true,      -- true = fully opaque black overlay
+    BLACK_SCREEN        = true,
     CULLING             = true,
     CULL_DISTANCE       = 250,
 
@@ -305,6 +301,13 @@ local lastFreedMB    = 0
 local dirtyCount = 0
 
 local counts = { parts = 0, sounds = 0, decals = 0, particles = 0, viewports = 0, guis = 0 }
+
+local HIST_LEN = 60
+local fpsHistory, ramHistory, pingHistory = {}, {}, {}
+local function pushHistory(t, v)
+    table.insert(t, v)
+    if #t > HIST_LEN then table.remove(t, 1) end
+end
 
 -- ============================================================
 --  PLAYER TRACKER
@@ -632,7 +635,7 @@ local function killHumanoid(char)
     end
 end
 
-local UI  -- forward declaration (UI table is defined below)
+local UI  -- forward declaration
 
 local function processInstance(obj)
     if not obj or not obj.Parent then return end
@@ -773,8 +776,7 @@ local function refreshCounts()
 end
 
 -- ============================================================
---  UI  -  FULLSCREEN BLACK STATUS OVERLAY
---  (no title bar, no buttons, no dragging, no minimize)
+--  UI  -  FULLSCREEN BLACK THEME
 -- ============================================================
 UI = { guis = {} }
 
@@ -786,36 +788,372 @@ UI.isOurGui = function(obj)
 end
 
 local Theme = {
-    text    = Color3.fromRGB(235, 235, 245),
-    textDim = Color3.fromRGB(150, 150, 175),
-    accent  = Color3.fromRGB(120, 200, 255),
-    good    = Color3.fromRGB(90, 230, 150),
-    warn    = Color3.fromRGB(255, 190, 80),
-    bad     = Color3.fromRGB(255, 100, 110),
+    bg0     = Color3.fromRGB(0, 0, 0),
+    bg1     = Color3.fromRGB(6, 6, 10),
+    bg2     = Color3.fromRGB(16, 16, 22),
+    bg3     = Color3.fromRGB(26, 26, 36),
+    stroke  = Color3.fromRGB(48, 48, 66),
+    text    = Color3.fromRGB(230, 230, 240),
+    textDim = Color3.fromRGB(140, 140, 165),
+    accentA = Color3.fromRGB(150, 90, 255),
+    accentB = Color3.fromRGB(80, 200, 255),
+    success = Color3.fromRGB(60, 220, 130),
+    warning = Color3.fromRGB(255, 180, 60),
+    danger  = Color3.fromRGB(255, 80, 100),
 }
+
+-- Safe property setter helper: silently drops invalid properties
+local function safeSet(inst, props)
+    for k, v in pairs(props or {}) do
+        pcall(function() inst[k] = v end)
+    end
+end
 
 local function new(class, props, children)
     local inst = Instance.new(class)
-    for k, v in pairs(props or {}) do inst[k] = v end
+    safeSet(inst, props)
     for _, c in ipairs(children or {}) do c.Parent = inst end
     return inst
 end
 
--- ---- Notification log (replaces toasts) ----
-local LOG_MAX = 6
-UI.logLines = {}
-
-local function notify(title, text, kind)
-    local line = ("[%s] %s"):format(tostring(title), tostring(text))
-    table.insert(UI.logLines, 1, line)
-    while #UI.logLines > LOG_MAX do table.remove(UI.logLines) end
-    if UI.logLabel then
-        UI.logLabel.Text = table.concat(UI.logLines, "\n")
-    end
-    print("[FPS v26] " .. line)
+local function corner(parent, r)
+    return new("UICorner", { CornerRadius = UDim.new(0, r or 8), Parent = parent })
 end
 
--- ---- Presets (kept as API, no buttons) ----
+local function stroke(parent, color, thickness, transparency)
+    return new("UIStroke", {
+        Color = color or Theme.stroke,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Parent = parent,
+    })
+end
+
+local function gradient(parent, a, b, rot)
+    return new("UIGradient", {
+        Color = ColorSequence.new {
+            ColorSequenceKeypoint.new(0, a or Theme.accentA),
+            ColorSequenceKeypoint.new(1, b or Theme.accentB),
+        },
+        Rotation = rot or 0,
+        Parent = parent,
+    })
+end
+
+local function padding(parent, t, r, b, l)
+    return new("UIPadding", {
+        PaddingTop = UDim.new(0, t or 0),
+        PaddingRight = UDim.new(0, r or 0),
+        PaddingBottom = UDim.new(0, b or 0),
+        PaddingLeft = UDim.new(0, l or 0),
+        Parent = parent,
+    })
+end
+
+-- ---- Notification toasts ----
+local notifContainer
+
+local function notify(title, text, kind)
+    if not notifContainer then return end
+    local color = Theme.accentA
+    if kind == "success" then color = Theme.success
+    elseif kind == "warn" then color = Theme.warning
+    elseif kind == "danger" then color = Theme.danger
+    end
+
+    local frame = new("Frame", {
+        Size = UDim2.new(0, 300, 0, 62),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, 320, 0, 0),
+        Parent = notifContainer,
+    })
+    corner(frame, 10)
+    stroke(frame, color, 1, 0.4)
+
+    local accent = new("Frame", {
+        Size = UDim2.new(0, 3, 1, -16),
+        Position = UDim2.new(0, 6, 0, 8),
+        BackgroundColor3 = color,
+        BorderSizePixel = 0,
+        Parent = frame,
+    })
+    corner(accent, 2)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -22, 0, 20),
+        Position = UDim2.new(0, 16, 0, 8),
+        BackgroundTransparency = 1,
+        Text = title,
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = frame,
+    })
+    new("TextLabel", {
+        Size = UDim2.new(1, -22, 1, -30),
+        Position = UDim2.new(0, 16, 0, 26),
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        Parent = frame,
+    })
+
+    for _, child in ipairs(notifContainer:GetChildren()) do
+        if child:IsA("Frame") and child ~= frame then
+            TweenService:Create(child, TweenInfo.new(0.25), {
+                Position = child.Position + UDim2.new(0, 0, 0, 70),
+            }):Play()
+        end
+    end
+
+    TweenService:Create(frame, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+        Position = UDim2.new(1, -316, 0, 0),
+    }):Play()
+
+    task.delay(4.5, function()
+        local t = TweenService:Create(frame, TweenInfo.new(0.25), {
+            Position = UDim2.new(1, 320, 0, 0),
+        })
+        t:Play()
+        t.Completed:Connect(function() frame:Destroy() end)
+    end)
+end
+
+-- ---- Sparkline widget ----
+local function makeSparkline(parent, title, color, maxValue)
+    local wrap = new("Frame", {
+        Size = UDim2.new(0.5, -6, 0, 88),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = parent,
+    })
+    corner(wrap, 10); stroke(wrap, Theme.stroke, 1, 0.6)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 18),
+        Position = UDim2.new(0, 10, 0, 8),
+        BackgroundTransparency = 1,
+        Text = title,
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = wrap,
+    })
+
+    local valueLbl = new("TextLabel", {
+        Size = UDim2.new(1, -16, 0, 20),
+        Position = UDim2.new(0, 10, 0, 24),
+        BackgroundTransparency = 1,
+        Text = "0",
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 15,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = wrap,
+    })
+
+    local chart = new("Frame", {
+        Size = UDim2.new(1, -20, 0, 32),
+        Position = UDim2.new(0, 10, 1, -40),
+        BackgroundTransparency = 1,
+        ClipsDescendants = true,
+        Parent = wrap,
+    })
+
+    local bars = {}
+    for i = 1, HIST_LEN do
+        local bar = new("Frame", {
+            Size = UDim2.new(1/HIST_LEN - 0.003, 0, 0, 0),
+            Position = UDim2.new((i-1)/HIST_LEN, 0, 1, 0),
+            AnchorPoint = Vector2.new(0, 1),
+            BackgroundColor3 = color,
+            BorderSizePixel = 0,
+            Parent = chart,
+        })
+        bars[i] = bar
+    end
+
+    local function setValue(v)
+        valueLbl.Text = tostring(v)
+        local history = pingHistory
+        if title:find("FPS") then
+            history = fpsHistory
+        elseif title:find("RAM") then
+            history = ramHistory
+        end
+        for i = 1, HIST_LEN do
+            local val = history[i] or 0
+            local h = math.clamp(val / (maxValue or 100), 0, 1)
+            bars[i].Size = UDim2.new(1/HIST_LEN - 0.003, 0, h, 0)
+        end
+    end
+
+    return { wrap = wrap, setValue = setValue }
+end
+
+-- ---- Toggle switch ----
+local function makeToggle(parent, label, getter, setter)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 34),
+        BackgroundTransparency = 1,
+        Parent = parent,
+    })
+    new("TextLabel", {
+        Size = UDim2.new(1, -70, 1, 0),
+        BackgroundTransparency = 1,
+        Text = label,
+        TextColor3 = Theme.text,
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+    local track = new("Frame", {
+        Size = UDim2.new(0, 44, 0, 22),
+        Position = UDim2.new(1, -50, 0.5, -11),
+        BackgroundColor3 = getter() and Theme.accentA or Theme.bg3,
+        BorderSizePixel = 0,
+        Parent = row,
+    })
+    corner(track, 11)
+    local knob = new("Frame", {
+        Size = UDim2.new(0, 16, 0, 16),
+        Position = getter() and UDim2.new(1, -20, 0.5, -8) or UDim2.new(0, 4, 0.5, -8),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Parent = track,
+    })
+    corner(knob, 8)
+
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "",
+        Parent = row,
+    })
+    btn.MouseButton1Click:Connect(function()
+        local newVal = not getter()
+        setter(newVal)
+        TweenService:Create(track, TweenInfo.new(0.2), {
+            BackgroundColor3 = newVal and Theme.accentA or Theme.bg3,
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.2), {
+            Position = newVal and UDim2.new(1, -20, 0.5, -8) or UDim2.new(0, 4, 0.5, -8),
+        }):Play()
+    end)
+
+    return row
+end
+
+-- ---- Slider ----
+local function makeSlider(parent, label, min, max, getter, setter)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 46),
+        BackgroundTransparency = 1,
+        Parent = parent,
+    })
+    new("TextLabel", {
+        Size = UDim2.new(0.5, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Text = label,
+        TextColor3 = Theme.text,
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+    local valLbl = new("TextLabel", {
+        Size = UDim2.new(0.5, 0, 0, 18),
+        Position = UDim2.new(0.5, 0, 0, 0),
+        BackgroundTransparency = 1,
+        Text = tostring(getter()),
+        TextColor3 = Theme.accentB,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Parent = row,
+    })
+    local bar = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 6),
+        Position = UDim2.new(0, 0, 0, 28),
+        BackgroundColor3 = Theme.bg3,
+        BorderSizePixel = 0,
+        Parent = row,
+    })
+    corner(bar, 3)
+    local fill = new("Frame", {
+        Size = UDim2.new((getter() - min) / (max - min), 0, 1, 0),
+        BackgroundColor3 = Theme.accentA,
+        BorderSizePixel = 0,
+        Parent = bar,
+    })
+    corner(fill, 3)
+
+    local function updateFromX(x)
+        local rel = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+        local value = math.floor(min + rel * (max - min) + 0.5)
+        valLbl.Text = tostring(value)
+        fill.Size = UDim2.new((value - min) / (max - min), 0, 1, 0)
+        setter(value)
+    end
+
+    local dragging = false
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            updateFromX(input.Position.X)
+        end
+    end)
+    UserInputSvc.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            updateFromX(input.Position.X)
+        end
+    end)
+    UserInputSvc.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+            PERSIST.toggles = PERSIST.toggles or {}
+            saveState(PERSIST)
+        end
+    end)
+
+    return row
+end
+
+-- ---- Main window (FULLSCREEN) ----
+local mainWindow, pageContainer
+local pageFrames = {}
+local tabButtons = {}
+local activeTab = "Dashboard"
+
+local function setTab(name)
+    activeTab = name
+    for n, frame in pairs(pageFrames) do
+        frame.Visible = (n == name)
+    end
+    for n, btn in pairs(tabButtons) do
+        local isActive = (n == name)
+        TweenService:Create(btn, TweenInfo.new(0.2), {
+            BackgroundColor3 = isActive and Theme.bg2 or Theme.bg0,
+            TextColor3 = isActive and Theme.text or Theme.textDim,
+        }):Play()
+        local ind = btn:FindFirstChild("Indicator")
+        if ind then ind.Visible = isActive end
+    end
+end
+
 local function setPreset(name)
     local presets = {
         MaxFPS = {
@@ -844,10 +1182,31 @@ local function setPreset(name)
     for k, v in pairs(p) do PERSIST.toggles[k] = v end
     saveState(PERSIST)
     if ENABLED and not AFK_ACTIVE then setCap(CFG.ACTIVE_FPS) end
-    notify("Preset", name .. " applied")
+    notify("Preset", name .. " applied", "success")
 end
 
 local function buildUI()
+    -- Black screen overlay FIRST (behind UI, on top of everything else)
+    local bsGui = new("ScreenGui", {
+        Name = "FpsBlackScreen",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = 2147483646,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        Parent = PLAYER_GUI,
+    })
+    table.insert(UI.guis, bsGui)
+    local bsFrame = new("Frame", {
+        Size = UDim2.new(1, 4, 1, 4),
+        Position = UDim2.new(0, -2, 0, -2),
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BorderSizePixel = 0,
+        Visible = true,
+        Parent = bsGui,
+    })
+    UI.blackFrame = bsFrame
+
+    -- Main full-screen UI
     local gui = new("ScreenGui", {
         Name = "FpsBoosterUI",
         ResetOnSpawn = false,
@@ -858,72 +1217,650 @@ local function buildUI()
     })
     table.insert(UI.guis, gui)
 
-    -- Fullscreen black surface
-    local root = new("Frame", {
-        Name = "Overlay",
-        Size = UDim2.new(1, 0, 1, 0),
-        Position = UDim2.new(0, 0, 0, 0),
-        BackgroundColor3 = Color3.new(0, 0, 0),
-        BackgroundTransparency = blackScreenOn and 0 or 0.25,
-        BorderSizePixel = 0,
-        Active = false,
-        ClipsDescendants = true,
+    -- Toast container
+    notifContainer = new("Frame", {
+        Name = "Notifications",
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -16, 0, 16),
+        Size = UDim2.new(0, 300, 1, -32),
+        BackgroundTransparency = 1,
         Parent = gui,
     })
-    UI.root = root
+    new("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+        Parent = notifContainer,
+    })
 
-    -- Main status readout
+    -- FULLSCREEN main window
+    mainWindow = new("Frame", {
+        Name = "MainWindow",
+        Position = UDim2.new(0, 0, 0, 0),
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundColor3 = Theme.bg0,
+        BorderSizePixel = 0,
+        Visible = true,
+        Parent = gui,
+    })
+    stroke(mainWindow, Theme.accentA, 2, 0.55)
+
+    -- Header (status bar)
+    local header = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundColor3 = Theme.bg0,
+        BorderSizePixel = 0,
+        Parent = mainWindow,
+    })
+    new("Frame", {
+        Size = UDim2.new(1, 0, 0, 1),
+        Position = UDim2.new(0, 0, 1, -1),
+        BackgroundColor3 = Theme.stroke,
+        BorderSizePixel = 0,
+        Parent = header,
+    })
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -180, 1, 0),
+        Position = UDim2.new(0, 60, 0, 0),
+        BackgroundTransparency = 1,
+        Text = "FPS Booster  |  v26 Premium  |  Status",
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 15,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = header,
+    })
+
+    local logo = new("Frame", {
+        Size = UDim2.new(0, 32, 0, 32),
+        Position = UDim2.new(0, 16, 0.5, -16),
+        BackgroundColor3 = Theme.accentA,
+        BorderSizePixel = 0,
+        Parent = header,
+    })
+    corner(logo, 8)
+    gradient(logo, Theme.accentA, Theme.accentB, 45)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "F",
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 17,
+        Parent = logo,
+    })
+
+    -- Status pill (FIXED: removed AutoButtonColor which is TextButton-only)
+    local statusPill = new("TextLabel", {
+        Name = "StatusPill",
+        Size = UDim2.new(0, 180, 0, 30),
+        Position = UDim2.new(1, -196, 0.5, -15),
+        BackgroundColor3 = Theme.bg2,
+        Text = "Booting...",
+        TextColor3 = Theme.success,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        Parent = header,
+    })
+    corner(statusPill, 15)
+    stroke(statusPill, Theme.success, 1, 0.4)
+    UI.headerStatus = statusPill
+
+    -- Tab bar
+    local tabBar = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 44),
+        Position = UDim2.new(0, 0, 0, 52),
+        BackgroundColor3 = Theme.bg0,
+        BorderSizePixel = 0,
+        Parent = mainWindow,
+    })
+    new("Frame", {
+        Size = UDim2.new(1, 0, 0, 1),
+        Position = UDim2.new(0, 0, 1, -1),
+        BackgroundColor3 = Theme.stroke,
+        BorderSizePixel = 0,
+        Parent = tabBar,
+    })
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 0),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = tabBar,
+    })
+
+    local function makeTab(name)
+        local btn = new("TextButton", {
+            Size = UDim2.new(1/3, 0, 1, 0),
+            BackgroundColor3 = Theme.bg0,
+            Text = name,
+            TextColor3 = Theme.textDim,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 13,
+            AutoButtonColor = false,
+            Parent = tabBar,
+        })
+        local ind = new("Frame", {
+            Name = "Indicator",
+            Size = UDim2.new(1, -24, 0, 2),
+            Position = UDim2.new(0, 12, 1, -2),
+            BackgroundColor3 = Theme.accentB,
+            BorderSizePixel = 0,
+            Visible = false,
+            Parent = btn,
+        })
+        corner(ind, 1)
+        btn.MouseButton1Click:Connect(function() setTab(name) end)
+        tabButtons[name] = btn
+    end
+
+    makeTab("Dashboard")
+    makeTab("Settings")
+    makeTab("Diagnostics")
+
+    -- Page container
+    pageContainer = new("Frame", {
+        Size = UDim2.new(1, -24, 1, -110),
+        Position = UDim2.new(0, 12, 0, 98),
+        BackgroundTransparency = 1,
+        Parent = mainWindow,
+    })
+
+    -- ============================================
+    -- DASHBOARD
+    -- ============================================
+    local dash = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        ScrollBarImageColor3 = Theme.accentA,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        Parent = pageContainer,
+    })
+    new("UIListLayout", {
+        Padding = UDim.new(0, 10),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = dash,
+    })
+    padding(dash, 0, 6, 0, 0)
+    pageFrames.Dashboard = dash
+
+    local sparkRow = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 88),
+        BackgroundTransparency = 1,
+        Parent = dash,
+    })
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 12),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = sparkRow,
+    })
+
+    UI.fpsSpark = makeSparkline(sparkRow, "FPS", Theme.accentA, 60)
+    UI.ramSpark = makeSparkline(sparkRow, "RAM (MB)", Theme.accentB, 2000)
+
+    local pingRow = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 88),
+        BackgroundTransparency = 1,
+        Parent = dash,
+    })
+    UI.pingSpark = makeSparkline(pingRow, "PING (ms)", Theme.warning, 300)
+    UI.pingSpark.wrap.Size = UDim2.new(1, 0, 1, 0)
+
+    -- Presets row
+    local presetsRow = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 76),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = dash,
+    })
+    corner(presetsRow, 10); stroke(presetsRow, Theme.stroke, 1, 0.6)
+    new("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 22),
+        Position = UDim2.new(0, 12, 0, 8),
+        BackgroundTransparency = 1,
+        Text = "Presets",
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = presetsRow,
+    })
+    local presetBtnRow = new("Frame", {
+        Size = UDim2.new(1, -20, 0, 34),
+        Position = UDim2.new(0, 10, 0, 34),
+        BackgroundTransparency = 1,
+        Parent = presetsRow,
+    })
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 8),
+        Parent = presetBtnRow,
+    })
+
+    local function makePresetBtn(label, gradientA, gradientB, onClick)
+        local btn = new("TextButton", {
+            Size = UDim2.new(1/3, -6, 1, 0),
+            BackgroundColor3 = Theme.bg3,
+            Text = label,
+            TextColor3 = Color3.new(1, 1, 1),
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            AutoButtonColor = false,
+            Parent = presetBtnRow,
+        })
+        corner(btn, 8)
+        gradient(btn, gradientA, gradientB, 45)
+        btn.MouseButton1Click:Connect(onClick)
+    end
+
+    makePresetBtn("Max FPS", Color3.fromRGB(255,80,100), Color3.fromRGB(150,90,255),
+        function() setPreset("MaxFPS") end)
+    makePresetBtn("Balanced", Color3.fromRGB(150,90,255), Color3.fromRGB(80,200,255),
+        function() setPreset("Balanced") end)
+    makePresetBtn("Visual", Color3.fromRGB(80,200,255), Color3.fromRGB(60,220,130),
+        function() setPreset("Visual") end)
+
+    -- Quick Actions
+    local actionsRow = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 76),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = dash,
+    })
+    corner(actionsRow, 10); stroke(actionsRow, Theme.stroke, 1, 0.6)
+    new("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 22),
+        Position = UDim2.new(0, 12, 0, 8),
+        BackgroundTransparency = 1,
+        Text = "Quick Actions",
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = actionsRow,
+    })
+    local actionBtnRow = new("Frame", {
+        Size = UDim2.new(1, -20, 0, 34),
+        Position = UDim2.new(0, 10, 0, 34),
+        BackgroundTransparency = 1,
+        Parent = actionsRow,
+    })
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 8),
+        Parent = actionBtnRow,
+    })
+
+    local function makeActionBtn(label, color, onClick)
+        local btn = new("TextButton", {
+            Size = UDim2.new(0.25, -6, 1, 0),
+            BackgroundColor3 = Theme.bg3,
+            Text = label,
+            TextColor3 = Theme.text,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 11,
+            AutoButtonColor = false,
+            Parent = actionBtnRow,
+        })
+        corner(btn, 8); stroke(btn, color, 1, 0.5)
+        btn.MouseButton1Click:Connect(onClick)
+    end
+
+    makeActionBtn("Clean RAM", Theme.accentB, function()
+        cleanRAM("manual")
+        notify("RAM", ("Cleaned - freed %d MB"):format(lastFreed), "success")
+    end)
+    makeActionBtn("Reapply", Theme.accentA, function()
+        reapply("manual")
+        notify("Reapply", "Stripping reapplied", "success")
+    end)
+    makeActionBtn("Black", Theme.textDim, function()
+        blackScreenOn = not blackScreenOn
+        if UI.blackFrame then UI.blackFrame.Visible = blackScreenOn end
+        notify("Black Screen", blackScreenOn and "ON" or "OFF", "info")
+    end)
+    makeActionBtn("Mute", Theme.warning, function()
+        MUTE_ON = not MUTE_ON
+        if MUTE_ON then muteAllSounds("manual-on") else setMasterVolume(0.5) end
+        notify("Sound", MUTE_ON and "Muted" or "Unmuted", "info")
+    end)
+
+    -- Status box
+    local statusBox = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 200),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = dash,
+    })
+    corner(statusBox, 10); stroke(statusBox, Theme.stroke, 1, 0.6)
     UI.statusLabel = new("TextLabel", {
-        Name = "Status",
-        Size = UDim2.new(1, -48, 1, -190),
-        Position = UDim2.new(0, 24, 0, 24),
+        Size = UDim2.new(1, -24, 1, -16),
+        Position = UDim2.new(0, 12, 0, 8),
         BackgroundTransparency = 1,
         Text = "Booting...",
         TextColor3 = Theme.text,
         Font = Enum.Font.Code,
-        TextSize = 15,
+        TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextYAlignment = Enum.TextYAlignment.Top,
         TextWrapped = true,
-        RichText = false,
-        Parent = root,
+        Parent = statusBox,
     })
 
-    -- Notification log at the bottom
-    UI.logLabel = new("TextLabel", {
-        Name = "Log",
-        Size = UDim2.new(1, -48, 0, 130),
-        Position = UDim2.new(0, 24, 1, -154),
+    -- ============================================
+    -- SETTINGS
+    -- ============================================
+    local settingsPage = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0),
         BackgroundTransparency = 1,
-        Text = "",
-        TextColor3 = Theme.textDim,
-        Font = Enum.Font.Code,
-        TextSize = 12,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Bottom,
-        TextWrapped = true,
-        Parent = root,
-    })
-
-    -- Thin accent line separating status and log
-    new("Frame", {
-        Size = UDim2.new(1, -48, 0, 1),
-        Position = UDim2.new(0, 24, 1, -162),
-        BackgroundColor3 = Theme.accent,
-        BackgroundTransparency = 0.7,
         BorderSizePixel = 0,
-        Parent = root,
+        ScrollBarThickness = 4,
+        ScrollBarImageColor3 = Theme.accentA,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        Visible = false,
+        Parent = pageContainer,
     })
-end
+    new("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = settingsPage,
+    })
+    padding(settingsPage, 0, 6, 0, 0)
+    pageFrames.Settings = settingsPage
 
-local function setOverlayVisible(v)
-    if UI.root then UI.root.Visible = v and true or false end
-end
-
-local function applyOverlayStyle()
-    if UI.root then
-        UI.root.BackgroundTransparency = blackScreenOn and 0 or 0.25
+    local function sectionHeader(title)
+        new("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 22),
+            BackgroundTransparency = 1,
+            Text = title,
+            TextColor3 = Theme.accentB,
+            Font = Enum.Font.GothamBold,
+            TextSize = 11,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            Parent = settingsPage,
+        })
     end
+
+    local function toggleRow(key, label)
+        makeToggle(settingsPage, label,
+            function() return CFG[key] end,
+            function(v)
+                CFG[key] = v
+                PERSIST.toggles = PERSIST.toggles or {}
+                PERSIST.toggles[key] = v
+                saveState(PERSIST)
+                if key == "MUTE_ALL_SOUNDS" then
+                    MUTE_ON = v
+                    if MUTE_ON then muteAllSounds("toggle-on") else setMasterVolume(0.5) end
+                elseif key == "BLACK_SCREEN" then
+                    blackScreenOn = v
+                    if UI.blackFrame then UI.blackFrame.Visible = v end
+                end
+            end)
+    end
+
+    sectionHeader("Visual Stripping")
+    toggleRow("STRIP_TEXTURES", "Strip textures & decals")
+    toggleRow("FLATTEN_MAT", "Flatten materials")
+    toggleRow("DISABLE_SHADOWS", "Disable shadows")
+    toggleRow("KILL_POSTFX", "Kill post-processing / atmosphere")
+    toggleRow("KILL_PARTICLES", "Kill particles / beams / trails")
+    toggleRow("DROP_QUALITY", "Force quality level 1")
+    toggleRow("LOW_MESH", "Low mesh detail")
+
+    sectionHeader("Performance")
+    toggleRow("KILL_VIEWPORTS", "Destroy viewport frames")
+    toggleRow("KILL_HUMANOID", "Disable Animator / Humanoid state")
+    toggleRow("CULLING", "Distance culling")
+    toggleRow("REAPPLY_ON_SPAWN", "Reapply on respawn")
+
+    sectionHeader("Audio")
+    toggleRow("MUTE_ALL_SOUNDS", "Mute all sounds")
+
+    sectionHeader("Sliders")
+    makeSlider(settingsPage, "Active FPS cap", 1, 60,
+        function() return CFG.ACTIVE_FPS end,
+        function(v) CFG.ACTIVE_FPS = v; if ENABLED and not AFK_ACTIVE then setCap(v) end end)
+    makeSlider(settingsPage, "AFK FPS cap", 1, 30,
+        function() return CFG.AFK_FPS end,
+        function(v) CFG.AFK_FPS = v end)
+    makeSlider(settingsPage, "AFK timeout (s)", 3, 120,
+        function() return CFG.AFK_TIME end,
+        function(v) CFG.AFK_TIME = v end)
+    makeSlider(settingsPage, "Cull distance (studs)", 50, 1000,
+        function() return CFG.CULL_DISTANCE end,
+        function(v) CFG.CULL_DISTANCE = v end)
+    makeSlider(settingsPage, "RAM clean interval (s)", 15, 600,
+        function() return CFG.RAM_CLEAN_INTERVAL end,
+        function(v) CFG.RAM_CLEAN_INTERVAL = v end)
+    makeSlider(settingsPage, "Reapply interval (s)", 60, 900,
+        function() return CFG.REAPPLY_INTERVAL end,
+        function(v) CFG.REAPPLY_INTERVAL = v end)
+
+    -- ============================================
+    -- DIAGNOSTICS
+    -- ============================================
+    local diag = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        ScrollBarImageColor3 = Theme.accentA,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        Visible = false,
+        Parent = pageContainer,
+    })
+    new("UIListLayout", {
+        Padding = UDim.new(0, 10),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Parent = diag,
+    })
+    padding(diag, 0, 6, 0, 0)
+    pageFrames.Diagnostics = diag
+
+    local instBox = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 132),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = diag,
+    })
+    corner(instBox, 10); stroke(instBox, Theme.stroke, 1, 0.6)
+    new("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 22),
+        Position = UDim2.new(0, 12, 0, 8),
+        BackgroundTransparency = 1,
+        Text = "Instance Counts",
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = instBox,
+    })
+    UI.instGrid = new("Frame", {
+        Size = UDim2.new(1, -20, 1, -40),
+        Position = UDim2.new(0, 10, 0, 34),
+        BackgroundTransparency = 1,
+        Parent = instBox,
+    })
+    new("UIGridLayout", {
+        CellSize = UDim2.new(1/3, -6, 0, 32),
+        CellPadding = UDim2.new(0, 6, 0, 6),
+        Parent = UI.instGrid,
+    })
+    UI.instLabels = {}
+    for _, name in ipairs({ "parts", "sounds", "decals", "particles", "viewports", "guis" }) do
+        local lbl = new("TextLabel", {
+            BackgroundColor3 = Theme.bg3,
+            Text = name .. ": 0",
+            TextColor3 = Theme.text,
+            Font = Enum.Font.Code,
+            TextSize = 11,
+            Parent = UI.instGrid,
+        })
+        corner(lbl, 6)
+        UI.instLabels[name] = lbl
+    end
+
+    local benchBox = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 150),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = diag,
+    })
+    corner(benchBox, 10); stroke(benchBox, Theme.stroke, 1, 0.6)
+    new("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 22),
+        Position = UDim2.new(0, 12, 0, 8),
+        BackgroundTransparency = 1,
+        Text = "Benchmark (10s on / 10s off)",
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = benchBox,
+    })
+
+    local benchInitial = "No benchmark yet."
+    if PERSIST.benchmark then
+        local bo = PERSIST.benchmark.off or 0
+        local bn = PERSIST.benchmark.on or 0
+        benchInitial = string.format("Last: baseline %d FPS -> boosted %d FPS (+%d)", bo, bn, bn - bo)
+    end
+
+    UI.benchLabel = new("TextLabel", {
+        Size = UDim2.new(1, -20, 1, -80),
+        Position = UDim2.new(0, 12, 0, 34),
+        BackgroundTransparency = 1,
+        Text = benchInitial,
+        TextColor3 = Theme.text,
+        Font = Enum.Font.Code,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        Parent = benchBox,
+    })
+
+    local benchBtn = new("TextButton", {
+        Size = UDim2.new(1, -20, 0, 34),
+        Position = UDim2.new(0, 10, 1, -42),
+        BackgroundColor3 = Theme.accentA,
+        Text = "Run Benchmark",
+        TextColor3 = Color3.new(1, 1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        AutoButtonColor = false,
+        Parent = benchBox,
+    })
+    corner(benchBtn, 8)
+    gradient(benchBtn, Theme.accentA, Theme.accentB, 45)
+
+    local benchmarking = false
+    benchBtn.MouseButton1Click:Connect(function()
+        if benchmarking then return end
+        benchmarking = true
+        notify("Benchmark", "Measuring baseline (10s)...", "info")
+
+        local snapshot = {}
+        for k, v in pairs(CFG) do
+            if type(v) == "boolean" then snapshot[k] = v end
+        end
+
+        for k in pairs(snapshot) do
+            if k:match("^STRIP_") or k:match("^KILL_") or k:match("^FLATTEN_")
+                or k == "DROP_QUALITY" or k == "LOW_MESH" or k == "DISABLE_SHADOWS"
+                or k == "MUTE_ALL_SOUNDS" or k == "CULLING" then
+                CFG[k] = false
+            end
+        end
+
+        local f0, t0 = 0, tick()
+        local connOff = RunService.RenderStepped:Connect(function() f0 = f0 + 1 end)
+        task.wait(10)
+        connOff:Disconnect()
+        local offFPS = math.floor(f0 / (tick() - t0))
+
+        notify("Benchmark", "Measuring boosted (10s)...", "info")
+
+        for k, v in pairs(snapshot) do CFG[k] = v end
+
+        local f1, t1 = 0, tick()
+        local connOn = RunService.RenderStepped:Connect(function() f1 = f1 + 1 end)
+        task.wait(10)
+        connOn:Disconnect()
+        local onFPS = math.floor(f1 / (tick() - t1))
+
+        PERSIST.benchmark = { on = onFPS, off = offFPS, at = tick() }
+        saveState(PERSIST)
+
+        UI.benchLabel.Text = string.format(
+            "Last: baseline %d FPS -> boosted %d FPS (+%d)",
+            offFPS, onFPS, onFPS - offFPS)
+        notify("Benchmark",
+            ("Baseline %d -> Boosted %d FPS"):format(offFPS, onFPS),
+            onFPS > offFPS and "success" or "warn")
+        benchmarking = false
+
+        reapply("benchmark-restore")
+    end)
+
+    local brokenBox = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 130),
+        BackgroundColor3 = Theme.bg2,
+        BorderSizePixel = 0,
+        Parent = diag,
+    })
+    corner(brokenBox, 10); stroke(brokenBox, Theme.stroke, 1, 0.6)
+    new("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 22),
+        Position = UDim2.new(0, 12, 0, 8),
+        BackgroundTransparency = 1,
+        Text = "Broken Games (auto-learned)",
+        TextColor3 = Theme.textDim,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = brokenBox,
+    })
+    UI.brokenLabel = new("TextLabel", {
+        Size = UDim2.new(1, -20, 1, -56),
+        Position = UDim2.new(0, 12, 0, 34),
+        BackgroundTransparency = 1,
+        Text = "None",
+        TextColor3 = Theme.text,
+        Font = Enum.Font.Code,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        Parent = brokenBox,
+    })
+    local clearBroken = new("TextButton", {
+        Size = UDim2.new(1, -20, 0, 28),
+        Position = UDim2.new(0, 10, 1, -36),
+        BackgroundColor3 = Theme.bg3,
+        Text = "Clear Broken Games List",
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        AutoButtonColor = false,
+        Parent = brokenBox,
+    })
+    corner(clearBroken, 6); stroke(clearBroken, Theme.warning, 1, 0.5)
+    clearBroken.MouseButton1Click:Connect(function()
+        PERSIST.brokenGames = {}
+        saveState(PERSIST)
+        CURRENT_PLACE_BROKEN = false
+        notify("Broken Games", "List cleared", "success")
+    end)
+
+    setTab("Dashboard")
 end
 
 buildUI()
@@ -951,44 +1888,44 @@ end
 
 local function trackerStatusLine()
     if track.sameServer then
-        return string.format("Track   : %s  [SAME SERVER]", track.displayName)
+        return string.format("Track  : %s  [SAME SERVER]", track.displayName)
     end
     if not track.online and track.lastError then
-        return string.format("Track   : %s  [%s]", CFG.TRACK_USERNAME, track.lastError)
+        return string.format("Track  : %s  [%s]", CFG.TRACK_USERNAME, track.lastError)
     end
     if track.inGame then
-        return string.format("Track   : %s  [IN GAME]", track.displayName)
+        return string.format("Track  : %s  [IN GAME]", track.displayName)
     end
     if track.inStudio then
-        return string.format("Track   : %s  [STUDIO]", track.displayName)
+        return string.format("Track  : %s  [STUDIO]", track.displayName)
     end
     if track.online then
-        return string.format("Track   : %s  [ONLINE]", track.displayName)
+        return string.format("Track  : %s  [ONLINE]", track.displayName)
     end
-    return string.format("Track   : %s  [OFFLINE]", track.displayName)
+    return string.format("Track  : %s  [OFFLINE]", track.displayName)
 end
 
 local function trackerGameLine()
     if track.sameServer then
-        return string.format("Game    : %s  (you're here)", track.gameName or "this game")
+        return string.format("Game   : %s  (you're here)", track.gameName or "this game")
     end
     if track.inGame then
         if track.gameName and track.gameName ~= "" then
-            return string.format("Game    : %s", track.gameName)
+            return string.format("Game   : %s", track.gameName)
         end
-        if track.placeId then return string.format("Game    : (placeId %d)", track.placeId) end
-        return "Game    : (hidden)"
+        if track.placeId then return string.format("Game   : (placeId %d)", track.placeId) end
+        return "Game   : (hidden)"
     end
-    return "Game    : -"
+    return "Game   : -"
 end
 
 local function trackerJobLine()
     local jid = shortJobId(track.jobId)
-    if track.sameServer then return string.format("Server  : %s  [this server]", jid) end
+    if track.sameServer then return string.format("Server : %s  [this server]", jid) end
     if track.inGame and track.jobId and track.jobId ~= "" then
-        return string.format("Server  : %s", jid)
+        return string.format("Server : %s", jid)
     end
-    return "Server  : -"
+    return "Server : -"
 end
 
 local function autoJoinLine()
@@ -1004,56 +1941,9 @@ local function attemptCounterLine()
 end
 
 local function trackerNextCheckLine()
-    if track.lastUpdate == 0 then return "Next    : checking..." end
+    if track.lastUpdate == 0 then return "Next   : checking..." end
     local remaining = math.max(0, (track.lastUpdate + CFG.TRACK_POLL_INTERVAL) - tick())
-    return string.format("Next    : %ds", math.floor(remaining))
-end
-
-local function buildStatusText(ram, ping)
-    local uptime = formatUptime(tick() - START_TIME)
-    local state = "ON"
-    if AFK_ACTIVE then state = "AFK"
-    elseif not ENABLED then state = "OFF"
-    end
-
-    local sep = "------------------------------------------------------------"
-
-    local brokenList = {}
-    for pid, info in pairs(PERSIST.brokenGames) do
-        table.insert(brokenList, ("%s (%s)"):format(pid, info.reason or "?"))
-        if #brokenList >= 3 then break end
-    end
-    local brokenText = #brokenList > 0 and table.concat(brokenList, ", ") or "none"
-
-    return table.concat({
-        "============================================================",
-        "  FPS BOOSTER  v26  -  FULLSCREEN STATUS",
-        "============================================================",
-        "",
-        ("State   : %s        FPS : %d        Ping : %d ms"):format(state, currentFPS, ping),
-        ("Uptime  : %s        RAM : %d MB"):format(uptime, ram),
-        ("Mute    : %s        Black: %s        Broken place: %s"):format(
-            MUTE_ON and "ON" or "OFF",
-            blackScreenOn and "ON" or "OFF",
-            CURRENT_PLACE_BROKEN and "YES" or "no"),
-        ("Culling : %s (%d studs)   Dirty: %d"):format(
-            CFG.CULLING and "ON" or "OFF", CFG.CULL_DISTANCE, dirtyCount),
-        "",
-        sep,
-        trackerStatusLine(),
-        trackerGameLine(),
-        trackerJobLine(),
-        autoJoinLine(),
-        attemptCounterLine(),
-        trackerNextCheckLine(),
-        sep,
-        ("Parts: %d   Sounds: %d   Decals: %d"):format(
-            counts.parts or 0, counts.sounds or 0, counts.decals or 0),
-        ("Particles: %d   Viewports: %d   GUIs: %d"):format(
-            counts.particles or 0, counts.viewports or 0, counts.guis or 0),
-        sep,
-        ("Broken places learned: %s"):format(brokenText),
-    }, "\n")
+    return string.format("Next   : %ds", math.floor(remaining))
 end
 
 -- ============================================================
@@ -1070,13 +1960,45 @@ local function setupLoops()
 
             local ram = getMemoryMB()
             local ping = getPing()
+            pushHistory(fpsHistory, currentFPS)
+            pushHistory(ramHistory, ram)
+            pushHistory(pingHistory, ping)
+
+            if UI.fpsSpark then UI.fpsSpark.setValue(currentFPS) end
+            if UI.ramSpark then UI.ramSpark.setValue(ram) end
+            if UI.pingSpark then UI.pingSpark.setValue(ping) end
+
+            if UI.headerStatus then
+                local state = "ON"
+                if AFK_ACTIVE then state = "AFK"
+                elseif not ENABLED then state = "OFF"
+                end
+                UI.headerStatus.Text = ("%d FPS  |  %s"):format(currentFPS, state)
+                UI.headerStatus.TextColor3 = AFK_ACTIVE and Theme.warning
+                    or (ENABLED and Theme.success or Theme.danger)
+            end
 
             if UI.statusLabel then
-                UI.statusLabel.Text = buildStatusText(ram, ping)
-                local col = Theme.text
-                if AFK_ACTIVE then col = Theme.warn
-                elseif not ENABLED then col = Theme.bad end
-                UI.statusLabel.TextColor3 = col
+                local uptime = formatUptime(tick() - START_TIME)
+                local state = "ON"
+                if AFK_ACTIVE then state = "AFK"
+                elseif not ENABLED then state = "OFF"
+                end
+                local mut = MUTE_ON and "ON" or "OFF"
+                local bs = blackScreenOn and "ON" or "OFF"
+                local sep = "----------------------------------------------"
+                UI.statusLabel.Text = table.concat({
+                    ("Uptime : %s     FPS: %d [%s]     Ping: %d ms"):format(uptime, currentFPS, state, ping),
+                    ("RAM    : %d MB   Mute: %s   Black: %s   Broken: %s"):format(
+                        ram, mut, bs, CURRENT_PLACE_BROKEN and "YES" or "no"),
+                    sep,
+                    trackerStatusLine(),
+                    trackerGameLine(),
+                    trackerJobLine(),
+                    autoJoinLine(),
+                    attemptCounterLine(),
+                    trackerNextCheckLine(),
+                }, "\n")
             end
         end
     end)
@@ -1084,7 +2006,21 @@ local function setupLoops()
     task.spawn(function()
         while true do
             task.wait(5)
-            pcall(refreshCounts)
+            pcall(function()
+                refreshCounts()
+                if UI.instLabels then
+                    for name, lbl in pairs(UI.instLabels) do
+                        lbl.Text = name .. ": " .. tostring(counts[name] or 0)
+                    end
+                end
+                if UI.brokenLabel then
+                    local list = {}
+                    for pid, info in pairs(PERSIST.brokenGames) do
+                        table.insert(list, ("  %s (%s)"):format(pid, info.reason or "?"))
+                    end
+                    UI.brokenLabel.Text = #list > 0 and table.concat(list, "\n") or "None"
+                end
+            end)
         end
     end)
 
@@ -1239,11 +2175,11 @@ task.delay(5, function() queueSelf(false) end)
 
 task.defer(function()
     task.wait(2)
-    notify("FPS Booster v26", "Fullscreen status edition loaded")
+    notify("FPS Booster v26", "Fullscreen black UI loaded", "success")
     if CURRENT_PLACE_BROKEN then
-        notify("Warning", "This place is marked broken - stripping skipped")
+        notify("Warning", "This place is marked broken - stripping skipped", "warn")
     end
-    print("[FPS Booster v26 Fullscreen] Ready.")
+    print("[FPS Booster v26 Premium] Ready (fullscreen black UI).")
     print("  Place broken:", CURRENT_PLACE_BROKEN)
     print("  AutoJoin:", autoJoinOn and "ON" or "OFF")
     print("  Max attempts/hour:", CFG.MAX_ATTEMPTS_PER_HOUR,
@@ -1255,32 +2191,22 @@ end)
 -- ============================================================
 --  PUBLIC API
 -- ============================================================
-_G.__FPS_BOOSTER_V26.reapply     = reapply
-_G.__FPS_BOOSTER_V26.cleanRAM    = cleanRAM
-_G.__FPS_BOOSTER_V26.muteAll     = muteAllSounds
-_G.__FPS_BOOSTER_V26.track       = track
-_G.__FPS_BOOSTER_V26.refresh     = refreshTrack
-_G.__FPS_BOOSTER_V26.autoJoin    = tryAutoJoin
-_G.__FPS_BOOSTER_V26.queueSelf   = queueSelf
-_G.__FPS_BOOSTER_V26.cfg         = CFG
-_G.__FPS_BOOSTER_V26.ui          = UI
-_G.__FPS_BOOSTER_V26.notify      = notify
-_G.__FPS_BOOSTER_V26.setPreset   = setPreset
-_G.__FPS_BOOSTER_V26.setOverlay  = setOverlayVisible
-
-_G.__FPS_BOOSTER_V26.setBlack = function(v)
-    blackScreenOn = v and true or false
-    CFG.BLACK_SCREEN = blackScreenOn
-    applyOverlayStyle()
-end
-
+_G.__FPS_BOOSTER_V26.reapply   = reapply
+_G.__FPS_BOOSTER_V26.cleanRAM  = cleanRAM
+_G.__FPS_BOOSTER_V26.muteAll   = muteAllSounds
+_G.__FPS_BOOSTER_V26.track     = track
+_G.__FPS_BOOSTER_V26.refresh   = refreshTrack
+_G.__FPS_BOOSTER_V26.autoJoin  = tryAutoJoin
+_G.__FPS_BOOSTER_V26.queueSelf = queueSelf
+_G.__FPS_BOOSTER_V26.cfg       = CFG
+_G.__FPS_BOOSTER_V26.ui        = UI
+_G.__FPS_BOOSTER_V26.notify    = notify
 _G.__FPS_BOOSTER_V26.destroy = function()
     for _, g in ipairs(UI.guis) do pcall(function() g:Destroy() end) end
     pcall(setCap, 0)
     _G.__FPS_BOOSTER_V26 = nil
     print("[FPS v26] Destroyed")
 end
-
 _G.__FPS_BOOSTER_V26.resetSpam = function()
     PERSIST.lastTeleportAttempt = 0
     PERSIST.targets = {}
